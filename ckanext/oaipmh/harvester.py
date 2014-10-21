@@ -3,10 +3,12 @@ import json
 import unicodedata
 import string
 import urllib2
+import types
+import datetime
+from lxml import etree
 
 from ckan.model import Session, Package, Group
 from ckan import model
-
 from ckanext.harvest.harvesters.base import HarvesterBase
 from ckan.lib.munge import munge_tag
 from ckanext.harvest.model import HarvestObject
@@ -15,12 +17,63 @@ from ckan.model.authz import setup_default_user_roles
 from pylons import config
 
 import oaipmh.client
+import oaipmh.common
 from oaipmh.metadata import MetadataRegistry, oai_dc_reader
 from oaipmh.error import NoSetHierarchyError
+from oaipmh.datestamp import tolerant_datestamp_to_datetime
 
-from pprint import pprint
 
 log = logging.getLogger(__name__)
+
+def datestamp_to_datetime(datestamp, inclusive=False):
+    try:
+        splitted = datestamp.split('T')
+        if len(splitted) == 2:
+            d, t = splitted
+            if not t:
+                raise DatestampError(datestamp)
+            if t[-1] == 'Z':
+                t = t[:-1]
+            elif t[-5] == '+':
+                t = t[:-5]
+        else:
+            d = splitted[0]
+            if inclusive:
+                # used when a date was specified as ?until parameter
+                t = '23:59:59'
+            else:
+                t = '00:00:00'
+        YYYY, MM, DD = d.split('-')
+        hh, mm, ss = t.split(':') # this assumes there's no timezone info
+        return datetime.datetime(
+            int(YYYY), int(MM), int(DD), int(hh), int(mm), int(ss))
+    except ValueError:
+        raise DatestampError(datestamp)
+
+def Identify_impl(self, args, tree):
+    namespaces = self.getNamespaces()
+    evaluator = etree.XPathEvaluator(tree, namespaces=namespaces)
+    identify_node = evaluator.evaluate(
+        '/oai:OAI-PMH/oai:Identify')[0]
+    identify_evaluator = etree.XPathEvaluator(identify_node,
+                                              namespaces=namespaces)
+    e = identify_evaluator.evaluate
+
+    repositoryName = e('string(oai:repositoryName/text())')
+    baseURL = e('string(oai:baseURL/text())')
+    protocolVersion = e('string(oai:protocolVersion/text())')
+    adminEmails = e('oai:adminEmail/text()')
+    earliestDatestamp = datestamp_to_datetime(
+        e('string(oai:earliestDatestamp/text())'))
+    deletedRecord = e('string(oai:deletedRecord/text())')
+    granularity = e('string(oai:granularity/text())')
+    compression = e('oai:compression/text()')
+    # XXX description
+    identify = oaipmh.common.Identify(
+        repositoryName, baseURL, protocolVersion,
+        adminEmails, earliestDatestamp,
+        deletedRecord, granularity, compression)
+    return identify
 
 
 class OaipmhHarvester(HarvesterBase):
@@ -53,17 +106,20 @@ class OaipmhHarvester(HarvesterBase):
         :param harvest_job: HarvestJob object
         :returns: A list of HarvestObject ids
         '''
+        log.debug('In gather stage.')
         sets = []
         harvest_objs = []
         registry = MetadataRegistry()
         registry.registerReader('oai_dc', oai_dc_reader)
         client = oaipmh.client.Client(harvest_job.source.url, registry)
+        client.Identify_impl = types.MethodType(Identify_impl, client)
         try:
             identifier = client.identify()
         except urllib2.URLError:
             self._save_gather_error('Could not gather anything from %s!' %
                                     harvest_job.source.url, harvest_job)
             return None
+
         domain = identifier.repositoryName()
         group = Group.by_name(domain)
         if not group:
@@ -73,6 +129,7 @@ class OaipmhHarvester(HarvesterBase):
         try:
             for set in client.listSets():
                 identifier, name, _ = set
+                log.debug(name)
                 if query:
                     if query in name:
                         sets.append((identifier, name))
@@ -162,19 +219,19 @@ class OaipmhHarvester(HarvesterBase):
             for rec in records:
                 identifier, metadata, _ = rec
                 if metadata:
-                    name = metadata['title'][0] if len(metadata['title'])\
-                                                else identifier
+                    name = metadata['title'][0] if len(metadata['title']) \
+                        else identifier
                     title = name
-                    norm_title = unicodedata.normalize('NFKD', name)\
-                                 .encode('ASCII', 'ignore')\
-                                 .lower().replace(' ', '_')[:35]
+                    norm_title = unicodedata.normalize('NFKD', name) \
+                                     .encode('ASCII', 'ignore') \
+                                     .lower().replace(' ', '_')[:35]
                     slug = ''.join(e for e in norm_title
-                                    if e in string.ascii_letters + '_')
+                                   if e in string.ascii_letters + '_')
                     name = slug
-                    creator = metadata['creator'][0]\
-                                if len(metadata['creator']) else ''
-                    description = metadata['description'][0]\
-                                if len(metadata['description']) else ''
+                    creator = metadata['creator'][0] \
+                        if len(metadata['creator']) else ''
+                    description = metadata['description'][0] \
+                        if len(metadata['description']) else ''
                     pkg = Package.by_name(name)
                     if not pkg:
                         pkg = Package(name=name, title=title)
@@ -191,8 +248,8 @@ class OaipmhHarvester(HarvesterBase):
                                             tag_obj = model.Tag(name=tag)
                                         if tag_obj:
                                             pkgtag = model.PackageTag(
-                                                                  tag=tag_obj,
-                                                                  package=pkg)
+                                                tag=tag_obj,
+                                                package=pkg)
                                             Session.add(tag_obj)
                                             Session.add(pkgtag)
                             else:
@@ -203,8 +260,8 @@ class OaipmhHarvester(HarvesterBase):
                     pkg.notes = description
                     pkg.extras = extras
                     pkg.url = \
-                    "%s?verb=GetRecord&identifier=%s&metadataPrefix=oai_dc"\
-                                % (harvest_object.job.source.url, identifier)
+                        '%s?verb=GetRecord&identifier=%s&metadataPrefix=oai_dc' \
+                        % (harvest_object.job.source.url, identifier)
                     pkg.save()
                     harvest_object.package_id = pkg.id
                     Session.add(harvest_object)
@@ -213,10 +270,10 @@ class OaipmhHarvester(HarvesterBase):
                     for ids in metadata['identifier']:
                         if ids.startswith('http://'):
                             url = ids
-                    title = metadata['title'][0] if len(metadata['title'])\
-                                                    else ''
-                    description = metadata['description'][0]\
-                                    if len(metadata['description']) else ''
+                    title = metadata['title'][0] if len(metadata['title']) \
+                        else ''
+                    description = metadata['description'][0] \
+                        if len(metadata['description']) else ''
                     pkg.add_resource(url, description=description, name=title)
                     group.add_package_by_name(pkg.name)
                     subg_name = "%s - %s" % (domain, set_name)
